@@ -1,0 +1,279 @@
+import cv2
+import numpy as np
+import tensorflow as tf
+from google.colab import files
+import os
+
+print("=== AI-Based Mask and Social Distancing Monitoring ===")
+print("All packages imported successfully!")
+
+# Initialize Haar Cascade face detector
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+# Function to calculate distance between two points in pixels
+def calculate_distance(point1, point2):
+    return np.sqrt((point1[0] - point2[0])**2 + (point1[1] - point2[1])**2)
+
+# Function to convert pixel distance to cm (approximation)
+def pixels_to_cm(pixel_distance, reference_width_pixels=200, reference_width_cm=20):
+    # Assuming average face width is about 20cm and 200 pixels in the video
+    return (pixel_distance * reference_width_cm) / reference_width_pixels
+
+# Function to draw dotted rectangle
+def draw_dotted_rectangle(img, top_left, bottom_right, color, thickness=2, dot_length=10):
+    x1, y1 = top_left
+    x2, y2 = bottom_right
+    
+    # Draw top line
+    for x in range(x1, x2, dot_length*2):
+        cv2.line(img, (x, y1), (min(x+dot_length, x2), y1), color, thickness)
+    
+    # Draw bottom line
+    for x in range(x1, x2, dot_length*2):
+        cv2.line(img, (x, y2), (min(x+dot_length, x2), y2), color, thickness)
+    
+    # Draw left line
+    for y in range(y1, y2, dot_length*2):
+        cv2.line(img, (x1, y), (x1, min(y+dot_length, y2)), color, thickness)
+    
+    # Draw right line
+    for y in range(y1, y2, dot_length*2):
+        cv2.line(img, (x2, y), (x2, min(y+dot_length, y2)), color, thickness)
+
+# Improved mask detection function
+def detect_mask(face_roi):
+    try:
+        if face_roi.size == 0:
+            return False
+            
+        # Convert to different color spaces for better analysis
+        hsv = cv2.cvtColor(face_roi, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
+        
+        # Define skin color range in HSV
+        lower_skin = np.array([0, 20, 70], dtype=np.uint8)
+        upper_skin = np.array([20, 255, 255], dtype=np.uint8)
+        
+        # Create mask for skin color
+        skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
+        
+        # Calculate percentage of skin in the face area
+        height, width = face_roi.shape[:2]
+        if height > 0 and width > 0:
+            # Analyze lower part of face (where mask would be)
+            lower_face = skin_mask[height//2:, :]
+            skin_percentage = np.sum(lower_face > 0) / lower_face.size if lower_face.size > 0 else 0
+            
+            # Analyze texture/variance in the face area
+            variance = np.var(gray)
+            
+            # Combined heuristic: less skin in lower face + higher texture variance suggests mask
+            # (Masks often have more texture patterns than smooth skin)
+            mask_probability = (skin_percentage < 0.4) and (variance > 500)
+            
+            return mask_probability
+            
+        return False
+        
+    except Exception as e:
+        return False
+
+# Main processing function
+def process_video(input_path, output_path):
+    # Open video
+    cap = cv2.VideoCapture(input_path)
+    
+    if not cap.isOpened():
+        print("Error: Could not open video file")
+        return False
+    
+    # Get video properties
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    print(f"Video Info: {width}x{height}, FPS: {fps}, Total Frames: {total_frames}")
+    print("Processing started...")
+    
+    # Define codec and create VideoWriter
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    frame_count = 0
+    last_distance_update = 0
+    current_distance = 0
+    current_distancing_status = "Social Distancing"
+    distancing_color = (255, 255, 255)  # White initially
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        # Create a copy of the frame for drawing
+        display_frame = frame.copy()
+        
+        # Convert to grayscale for face detection
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Detect faces with improved parameters
+        faces = face_cascade.detectMultiScale(
+            gray, 
+            scaleFactor=1.05, 
+            minNeighbors=6, 
+            minSize=(50, 50),
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
+        
+        # Limit to maximum 2 faces as requested
+        faces = faces[:2]
+        
+        # Update distance every second (based on frames)
+        if frame_count % fps == 0 and len(faces) == 2:
+            x1, y1, w1, h1 = faces[0]
+            x2, y2, w2, h2 = faces[1]
+            
+            center1 = (x1 + w1//2, y1 + h1//2)
+            center2 = (x2 + w2//2, y2 + h2//2)
+            
+            pixel_distance = calculate_distance(center1, center2)
+            current_distance = pixels_to_cm(pixel_distance)
+            
+            # Check if too close (less than 10cm)
+            is_too_close = current_distance < 10
+            current_distancing_status = "Too Close!" if is_too_close else "Social Distancing"
+            distancing_color = (0, 0, 255) if is_too_close else (0, 255, 0)  # Red if too close, Green if safe
+            last_distance_update = frame_count
+        
+        # Process each face
+        for i, (x, y, w, h) in enumerate(faces):
+            # Ensure coordinates are within frame boundaries
+            x = max(0, x)
+            y = max(0, y)
+            w = min(w, width - x)
+            h = min(h, height - y)
+            
+            # Extract face ROI for mask detection
+            face_roi = frame[y:y+h, x:x+w]
+            
+            # Detect mask
+            has_mask = detect_mask(face_roi)
+            
+            # Draw dotted white box around face
+            draw_dotted_rectangle(display_frame, (x, y), (x+w, y+h), (255, 255, 255), 2)
+            
+            # Add mask status text above the box with green/red color
+            text = "Mask" if has_mask else "No Mask"
+            text_color = (0, 255, 0) if has_mask else (0, 0, 255)  # Green for mask, Red for no mask
+            
+            # Position mask text above the box
+            mask_y_offset = y - 10
+            cv2.putText(display_frame, text, (x, max(mask_y_offset, 25)), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
+        
+        # Display social distancing information between the two faces
+        if len(faces) == 2:
+            x1, y1, w1, h1 = faces[0]
+            x2, y2, w2, h2 = faces[1]
+            
+            # Calculate center points of both faces
+            center1 = (x1 + w1//2, y1 + h1//2)
+            center2 = (x2 + w2//2, y2 + h2//2)
+            
+            # Calculate midpoint between the two faces
+            midpoint = ((center1[0] + center2[0]) // 2, (center1[1] + center2[1]) // 2)
+            
+            # Draw connecting line between faces
+            cv2.line(display_frame, center1, center2, distancing_color, 2)
+            
+            # Display distance in cm
+            distance_text = f"Distance: {current_distance:.1f} cm"
+            cv2.putText(display_frame, distance_text, (midpoint[0] - 70, midpoint[1] - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, distancing_color, 2)
+            
+            # Display status text
+            cv2.putText(display_frame, current_distancing_status, (midpoint[0] - 60, midpoint[1] + 15), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, distancing_color, 2)
+        
+        # Display project title and face count information
+        cv2.putText(display_frame, "AI Mask & Social Distancing Monitor", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        faces_text = f"Faces Detected: {len(faces)}/2"
+        cv2.putText(display_frame, faces_text, (10, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Write frame to output video
+        out.write(display_frame)
+        
+        frame_count += 1
+        if frame_count % 30 == 0:
+            progress = (frame_count / total_frames) * 100
+            print(f"Progress: {progress:.1f}% ({frame_count}/{total_frames} frames)")
+    
+    # Release everything
+    cap.release()
+    out.release()
+    
+    print(f"Video processing completed! Output saved to: {output_path}")
+    return True
+
+# Function to upload video file
+def upload_video():
+    print("Please select your 10-second video file...")
+    uploaded = files.upload()
+    for filename in uploaded.keys():
+        file_size = len(uploaded[filename])
+        print(f'Uploaded: {filename} ({file_size} bytes)')
+        return filename
+    return None
+
+# Function to download processed video
+def download_video(filename):
+    if os.path.exists(filename):
+        print("Downloading processed video...")
+        files.download(filename)
+        return True
+    else:
+        print(f"Error: Output file {filename} not found")
+        return False
+
+# Main execution
+if __name__ == "__main__":
+    print("=== AI-Based Mask and Social Distancing Monitoring System ===")
+    print("This system will:")
+    print("1. Detect up to 2 faces in your video")
+    print("2. Draw dotted white boxes around each face")
+    print("3. Detect masks (Green 'Mask' text if wearing, Red 'No Mask' if not)")
+    print("4. Measure social distance every second in cm")
+    print("5. Display distance and status between the faces")
+    print()
+    
+    # Upload video
+    input_filename = upload_video()
+    
+    if input_filename:
+        output_filename = "ai_monitoring_" + input_filename
+        
+        print("\nStarting video processing...")
+        print("Please wait while we analyze your video...")
+        
+        success = process_video(input_filename, output_filename)
+        
+        if success:
+            print("\nProcessing completed successfully!")
+            print("Downloading your analyzed video...")
+            download_success = download_video(output_filename)
+            
+            if download_success:
+                print("\n✅ Done! Your analyzed video has been downloaded.")
+                print("Check your downloads folder for: ", output_filename)
+            else:
+                print("Download failed. Please try again.")
+        else:
+            print("Video processing failed. Please check your input file.")
+    else:
+        print("No file uploaded. Please run the cell again to upload your video.")
+
+print("\nThank you for using AI Mask & Social Distancing Monitor!")
